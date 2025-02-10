@@ -1,5 +1,6 @@
 from django.conf import settings
-
+import unicodedata
+import re
 import csv
 import os
 
@@ -21,8 +22,41 @@ from .models import UploadedFile
 import pytesseract
 from PIL import Image
 from pdf2image import convert_from_path
+from rest_framework.decorators import api_view
 
 POPPLER_PATH = "/opt/homebrew/bin/"
+
+
+@api_view(["GET"])
+def list_files(request):
+    """media/uploads と media/csv 内のファイル一覧を取得するAPI"""
+    pdf_dir = os.path.join(settings.MEDIA_ROOT, "uploads")
+    csv_dir = os.path.join(settings.MEDIA_ROOT, "csv")
+
+    pdf_files = os.listdir(pdf_dir) if os.path.exists(pdf_dir) else []
+    csv_files = os.listdir(csv_dir) if os.path.exists(csv_dir) else []
+
+    return JsonResponse({"pdf_files": pdf_files, "csv_files": csv_files}, status=200)
+
+
+@api_view(["DELETE"])
+def delete_file(request, file_type, filename):
+    """指定されたファイルを削除する"""
+    if file_type not in ["pdf", "csv"]:
+        return JsonResponse({"error": "Invalid file type"}, status=400)
+
+    # ファイルの保存ディレクトリを決定
+    file_dir = os.path.join(
+        settings.MEDIA_ROOT, "uploads" if file_type == "pdf" else "csv"
+    )
+    file_path = os.path.join(file_dir, filename)
+
+    # ファイルの存在をチェックして削除
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return JsonResponse({"message": f"{filename} を削除しました"}, status=200)
+    else:
+        return JsonResponse({"error": "ファイルが見つかりません"}, status=404)
 
 
 @api_view(["GET"])
@@ -39,12 +73,19 @@ def get_extracted_data(request, invoice_id):
     return Response(serializer.data)
 
 
+def sanitize_filename(filename):
+    """日本語・特殊文字を安全なファイル名に変換"""
+    filename = unicodedata.normalize("NFKD", filename)
+    filename = re.sub(r"[^\w\-_\.]", "_", filename)  # 不正な文字を置換
+    return filename
+
+
 @csrf_exempt
 def upload_invoice(request):
-    print("✅ POSTリクエストを受信")
+    print("✅ POSTリクエストを受信")  # デバッグ用ログ
 
     if request.method == "POST":
-        print(f"📂 request.FILES: {request.FILES}")
+        print(f"📂 request.FILES: {request.FILES}")  # デバッグ用ログ
 
         if "invoice" not in request.FILES:
             print("❌ 'invoice' がリクエストに含まれていません")
@@ -53,83 +94,43 @@ def upload_invoice(request):
         uploaded_file = request.FILES["invoice"]
         print(f"✅ ファイル受信: {uploaded_file.name}")
 
-        if uploaded_file:
-            save_path = os.path.join("media/uploads", uploaded_file.name)
-            with open(save_path, "wb+") as destination:
-                for chunk in uploaded_file.chunks():
-                    destination.write(chunk)
+        # ✅ media/uploads/ に保存
+        save_dir = os.path.join(settings.MEDIA_ROOT, "uploads")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, uploaded_file.name)
 
-            # PDF からテキスト抽出
-            extracted_text = extract_text_from_pdf(save_path)
+        with open(save_path, "wb+") as destination:
+            for chunk in uploaded_file.chunks():
+                destination.write(chunk)
 
-            if not extracted_text:
-                return JsonResponse({"error": "OCR に失敗しました"}, status=400)
+        print(f"✅ ファイル保存完了: {save_path}")
 
-            # CSV ファイルに変換して保存
-            csv_filename = uploaded_file.name.replace(".pdf", ".csv")
-            csv_path = os.path.join("media/csv", csv_filename)
-            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-            save_text_to_csv(extracted_text, csv_path)
+        # ✅ PDF → テキスト抽出
+        extracted_text = extract_text_from_pdf(save_path)
+        if not extracted_text:
+            print("❌ OCR に失敗しました")
+            return JsonResponse({"error": "Failed to extract text"}, status=500)
 
-            print(f"✅ CSV 変換完了: {csv_path}")
+        # ✅ CSV に変換して保存
+        csv_filename = uploaded_file.name.replace(".pdf", ".csv")
+        csv_dir = os.path.join(settings.MEDIA_ROOT, "csv")
+        os.makedirs(csv_dir, exist_ok=True)
+        csv_path = os.path.join(csv_dir, csv_filename)
 
-            return JsonResponse(
-                {"message": "File converted to CSV", "filename": csv_filename},
-                status=200,
-            )
+        save_text_to_csv(extracted_text, csv_path)
+
+        print(f"✅ CSV 変換完了: {csv_path}")
+
+        return JsonResponse(
+            {
+                "message": "File uploaded and converted to CSV successfully",
+                "filename": uploaded_file.name,
+                "csv_filename": csv_filename,
+            },
+            status=200,
+        )
 
     return JsonResponse({"error": "Invalid request"}, status=400)
-
-
-# @csrf_exempt
-# def upload_invoice(request):
-#     print("✅ POSTリクエストを受信")
-
-#     if request.method != "POST":
-#         return JsonResponse({"error": "Invalid request"}, status=400)
-
-#     print(f"📂 request.FILES: {request.FILES}")
-
-#     if "invoice" not in request.FILES:
-#         print("❌ 'invoice' がリクエストに含まれていません")
-#         return JsonResponse({"error": "No file uploaded"}, status=400)
-
-#     uploaded_file = request.FILES["invoice"]
-#     print(f"✅ ファイル受信: {uploaded_file.name}")
-
-#     # ファイル保存
-#     save_path = os.path.join(settings.MEDIA_ROOT, "uploads", uploaded_file.name)
-#     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-#     with open(save_path, "wb+") as destination:
-#         for chunk in uploaded_file.chunks():
-#             destination.write(chunk)
-
-#     print(f"✅ PDF 保存完了: {save_path}")
-
-#     # DB に保存
-#     instance = UploadedFile(file_name=uploaded_file.name, file_path=save_path)
-#     instance.save()
-#     print(f"✅ DB 登録完了: {instance.id}")
-
-#     # PDF からテキスト抽出
-#     extracted_text = extract_text_from_pdf(save_path)
-#     if not extracted_text:
-#         print("❌ PDF からテキストを抽出できませんでした")
-#         return JsonResponse({"error": "Failed to extract text from PDF"}, status=500)
-
-#     # CSV ファイルに変換して保存
-#     csv_filename = uploaded_file.name.replace(".pdf", ".csv")
-#     csv_path = os.path.join(settings.MEDIA_ROOT, "csv", csv_filename)
-#     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
-#     save_text_to_csv(extracted_text, csv_path)
-#     print(f"✅ CSV 変換完了: {csv_path}")
-
-#     return JsonResponse(
-#         {"message": "File uploaded and converted to CSV", "filename": csv_filename},
-#         status=200,
-#     )
 
 
 # @csrf_exempt
